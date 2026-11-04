@@ -421,12 +421,31 @@ int Slave_worker::rli_init_info(bool is_gaps_collecting_phase) {
     will be values to be read. Please, do not move this call after
     the handler->init_info().
   */
-  return_check = check_info();
-  if (return_check == ERROR_CHECKING_REPOSITORY ||
-      (return_check == REPOSITORY_DOES_NOT_EXIST && is_gaps_collecting_phase))
-    goto err;
+  THD *thd = c_rli->info_thd;
+  while (true) {
+    int error = 0;
+    return_check = check_info(&error);
 
-  if (handler->init_info()) goto err;
+    if (error == 0) {
+      if (return_check == ERROR_CHECKING_REPOSITORY ||
+          (return_check == REPOSITORY_DOES_NOT_EXIST &&
+           is_gaps_collecting_phase))
+        goto err;
+      error = handler->init_info();
+    }
+    if (error == 0) break;
+
+    if (error != HA_ERR_LOCK_WAIT_TIMEOUT) goto err;
+    DBUG_EXECUTE_IF("sync_worker_info_lock_wait_timeout", {
+      const char action[] = "now SIGNAL worker_info_lock_wait_timeout";
+      debug_sync_set_action(thd, STRING_WITH_LEN(action));
+    });
+    if (c_rli->pending_stop_requests > 0 || connection_events_loop_aborted() ||
+        (thd != nullptr && thd->killed))
+      goto err;
+
+    if (thd != nullptr) thd->clear_error();
+  }
 
   bitmap_init(&group_executed, nullptr, num_bits);
   bitmap_init(&group_shifted, nullptr, num_bits);

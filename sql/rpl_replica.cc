@@ -786,7 +786,12 @@ bool start_slave_cmd(THD *thd) {
 
   DEBUG_SYNC(thd, "begin_start_replica");
 
-  channel_map.wrlock();
+  /*
+    START does not modify the channel map. Holding a read lock also lets a
+    concurrent STOP find the channel and announce its stop request while START
+    waits for the replication thread to finish initialization.
+  */
+  channel_map.rdlock();
 
   DEBUG_SYNC(thd, "after_locking_channel_map_in_start_replica");
 
@@ -2179,20 +2184,9 @@ bool start_slave_threads(bool need_lock_slave, bool wait_for_start,
   }
 
   if (!is_error && (thread_mask & REPLICA_SQL)) {
-    /*
-      MTS-recovery gaps gathering is placed onto common execution path
-      for either START-SLAVE and --skip-start-replica= 0
-    */
-    if (mi->rli->recovery_parallel_workers != 0) {
-      if (mts_recovery_groups(mi->rli)) {
-        is_error = true;
-        my_error(ER_MTA_RECOVERY_FAILURE, MYF(0));
-      }
-    }
-    if (!is_error)
-      is_error = start_slave_thread(
-          key_thread_replica_sql, handle_slave_sql, lock_sql, lock_cond_sql,
-          cond_sql, &mi->rli->slave_running, &mi->rli->slave_run_id, mi);
+    is_error = start_slave_thread(
+        key_thread_replica_sql, handle_slave_sql, lock_sql, lock_cond_sql,
+        cond_sql, &mi->rli->slave_running, &mi->rli->slave_run_id, mi);
     if (is_error)
       terminate_slave_threads(mi, thread_mask & (REPLICA_IO | SLAVE_MONITOR),
                               rpl_stop_replica_timeout, need_lock_slave);
@@ -7269,6 +7263,18 @@ extern "C" void *handle_slave_sql(void *arg) {
         goto err;
       }
 
+      if (rli->recovery_parallel_workers != 0) {
+        const bool recovery_error = mts_recovery_groups(rli);
+        if (recovery_error) {
+          mysql_cond_broadcast(&rli->start_cond);
+          mysql_mutex_unlock(&rli->run_lock);
+          rli->report(ERROR_LEVEL, ER_REPLICA_FATAL_ERROR,
+                      ER_THD(thd, ER_REPLICA_FATAL_ERROR),
+                      "Failed during replica MTS gap recovery");
+          goto err;
+        }
+      }
+
       /* MTS: starting the worker pool */
       if (!rli->is_csa_enabled() &&
           slave_start_workers(rli, rli->get_applier_worker_count(),
@@ -9351,6 +9357,15 @@ int stop_slave(THD *thd, Master_info *mi, bool net_report, bool for_one_channel,
              "SUPER or REPLICATION_SLAVE_ADMIN");
     return 1;
   }
+
+  const bool stops_sql_thread =
+      !thd->lex->replica_thd_opt || (thd->lex->replica_thd_opt & REPLICA_SQL);
+  if (stops_sql_thread) {
+    ++mi->rli->pending_stop_requests;
+  }
+  Scope_guard pending_stop_request_guard([&]() {
+    if (stops_sql_thread) --mi->rli->pending_stop_requests;
+  });
 
   mi->channel_wrlock();
 
